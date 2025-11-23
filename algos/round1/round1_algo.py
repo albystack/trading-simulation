@@ -1,0 +1,216 @@
+from datamodel import Listing, Order, State
+from collections import deque
+import statistics
+
+
+class Trader:
+    """
+    Round 1: SMART Market Making + Statistical Arbitrage
+    
+    Key lessons from analysis:
+    - Crossing spread is VERY expensive (23% win rate = -45k PnL)
+    - Need to be PASSIVE and let others cross to us
+    - Focus on spread capture, not directional bets
+    - Use large sizes but NEVER take liquidity aggressively
+    - CASTLE_STOCKS has most bot activity - size up there
+    
+    Strategy:
+    1. Always provide liquidity (never take)
+    2. Quote inside spread when wide
+    3. Large sizes to maximize spread capture
+    4. Smart inventory management
+    """
+
+    def __init__(self):
+        self.window = 40
+        self.mids_history = {}
+        
+        # Optimized for passive profit
+        self.params = {
+            'HATFIELD_STOCKS': {
+                'base_size': 18,
+                'max_size': 25,
+                'inv_threshold': 23
+            },
+            'COLLINGWOOD_STOCKS': {
+                'base_size': 18,
+                'max_size': 25,
+                'inv_threshold': 23
+            },
+            'CHADS_STOCKS': {
+                'base_size': 18,
+                'max_size': 25,
+                'inv_threshold': 23
+            },
+            'JOHNS_STOCKS': {
+                'base_size': 17,
+                'max_size': 24,
+                'inv_threshold': 23
+            },
+            'CASTLE_STOCKS': {
+                'base_size': 22,  # Largest - most bot activity
+                'max_size': 28,
+                'inv_threshold': 25
+            },
+            'CUTHS_STOCKS': {
+                'base_size': 18,
+                'max_size': 25,
+                'inv_threshold': 23
+            },
+            # Default for any other products (e.g., 10K_NOTE)
+            'DEFAULT': {
+                'base_size': 15,
+                'max_size': 20,
+                'inv_threshold': 18
+            }
+        }
+        
+        self.tick_count = 0
+
+    def get_market_info(self, product, orderbook):
+        ob = orderbook.get(product)
+        if not ob or not ob["BUY"] or not ob["SELL"]:
+            return None
+        
+        best_bid = max(ob["BUY"].keys())
+        best_ask = min(ob["SELL"].keys())
+        
+        return {
+            'mid': (best_bid + best_ask) / 2,
+            'best_bid': best_bid,
+            'best_ask': best_ask,
+            'spread': best_ask - best_bid
+        }
+
+    def calculate_fair_value(self, product):
+        """Moving average as fair value"""
+        history = self.mids_history.get(product)
+        if not history or len(history) < 20:
+            return None
+        return statistics.mean(list(history)[-25:])
+
+    def run(self, state: State):
+        orders = []
+        self.tick_count += 1
+        
+        # Initialize
+        for product in state.products:
+            if product not in self.mids_history:
+                self.mids_history[product] = deque(maxlen=self.window)
+        
+        for product in state.products:
+            market_info = self.get_market_info(product, state.orderbook)
+            if not market_info:
+                continue
+            
+            mid = market_info['mid']
+            best_bid = market_info['best_bid']
+            best_ask = market_info['best_ask']
+            spread = market_info['spread']
+            
+            self.mids_history[product].append(mid)
+            
+            # Get parameters - use DEFAULT if product not in params
+            params = self.params.get(product, self.params['DEFAULT'])
+            base_size = params['base_size']
+            max_size = params['max_size']
+            inv_threshold = params['inv_threshold']
+            
+            pos = state.positions.get(product, 0)
+            limit = state.pos_limit.get(product, 30)
+            
+            # Fair value for micro-adjustments
+            fair_value = self.calculate_fair_value(product)
+            fv_signal = 0
+            if fair_value:
+                deviation = mid - fair_value
+                if abs(deviation) > 0.8:
+                    fv_signal = -1 if deviation > 0 else 1  # -1 = price rich, +1 = price cheap
+            
+            # Determine quote prices - ALWAYS PASSIVE
+            if spread >= 5:
+                # Very wide - go 2 ticks inside
+                our_bid = best_bid + 2
+                our_ask = best_ask - 2
+            elif spread == 4:
+                # Wide - go 1 tick inside
+                our_bid = best_bid + 1
+                our_ask = best_ask - 1
+            elif spread == 3:
+                # Medium - penny
+                our_bid = best_bid + 1
+                our_ask = best_ask - 1
+            else:
+                # Tight - join
+                our_bid = best_bid
+                our_ask = best_ask
+            
+            # Size determination
+            buy_size = base_size
+            sell_size = base_size
+            
+            # Increase size when spread is wide (more profit per trade)
+            if spread >= 4:
+                buy_size = min(max_size, base_size + 4)
+                sell_size = min(max_size, base_size + 4)
+            elif spread == 3:
+                buy_size = min(max_size, base_size + 2)
+                sell_size = min(max_size, base_size + 2)
+            
+            # Fair value tilt (small size adjustment)
+            if fv_signal > 0:  # Price cheap
+                buy_size = min(max_size, int(buy_size * 1.15))
+                sell_size = max(8, int(sell_size * 0.90))
+            elif fv_signal < 0:  # Price rich
+                sell_size = min(max_size, int(sell_size * 1.15))
+                buy_size = max(8, int(buy_size * 0.90))
+            
+            # Inventory management - CRITICAL
+            pos_ratio = pos / limit
+            
+            if pos > inv_threshold:
+                # Long inventory - skew to sell
+                our_bid = best_bid - 1  # Pull back bid
+                our_ask = min(best_ask, best_bid + 2)  # Aggressive ask
+                buy_size = max(4, int(buy_size * 0.30))
+                sell_size = min(max_size + 5, int(sell_size * 1.7))
+                
+            elif pos < -inv_threshold:
+                # Short inventory - skew to buy
+                our_bid = max(best_bid, best_ask - 2)  # Aggressive bid
+                our_ask = best_ask + 1  # Pull back ask
+                buy_size = min(max_size + 5, int(buy_size * 1.7))
+                sell_size = max(4, int(sell_size * 0.30))
+            
+            # Moderate inventory tilt (earlier intervention)
+            elif pos > 15:
+                buy_size = int(buy_size * 0.7)
+                sell_size = int(sell_size * 1.2)
+            elif pos < -15:
+                buy_size = int(buy_size * 1.2)
+                sell_size = int(sell_size * 0.7)
+            
+            # Emergency: approaching limits
+            if pos >= limit - 3:
+                # MUST reduce long
+                our_ask = best_bid + 1  # Very aggressive sell
+                buy_size = 0
+                sell_size = min(28, limit + pos)
+            elif pos <= -limit + 3:
+                # MUST reduce short
+                our_bid = best_ask - 1  # Very aggressive buy
+                sell_size = 0
+                buy_size = min(28, limit - pos)
+            
+            # Place orders - ONLY PASSIVE
+            if buy_size > 0 and pos < limit:
+                actual_buy = min(buy_size, limit - pos)
+                if actual_buy > 0 and our_bid < best_ask:  # NEVER CROSS
+                    orders.append(Order(product, int(our_bid), int(actual_buy)))
+            
+            if sell_size > 0 and pos > -limit:
+                actual_sell = min(sell_size, limit + pos)
+                if actual_sell > 0 and our_ask > best_bid:  # NEVER CROSS
+                    orders.append(Order(product, int(our_ask), -int(actual_sell)))
+        
+        return orders
